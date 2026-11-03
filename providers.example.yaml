@@ -1,0 +1,58 @@
+# llm-proxy providers & models
+# Copy to providers.yaml (gitignored) and adjust. Restart the service after edits.
+#
+# providers: any OpenAI-compatible API. base_url must end with /v1 (or the
+#            provider's equivalent). API keys never live here — put the key in
+#            .env and name the variable in api_key_env. A provider whose key
+#            variable is empty is skipped (with its models) instead of crashing.
+#
+# models:    the names clients send in "model". Each points to a provider and
+#            the upstream model id.
+#   tools:    true if the model supports OpenAI tool calling (default true).
+#             When true, web_search / fetch_url are offered and run by the proxy.
+#   fallback: alias to switch to on any upstream error (network, 429, 5xx,
+#             bad key…). Once switched, the rest of the request stays there.
+#   external: data leaves the LAN (auto-detected from base_url; shown in /v1/models).
+#
+# Unknown or missing "model" in a request -> default_model.
+
+default_model: gemma-local
+
+providers:
+  local:
+    base_url: http://192.168.10.245:8080/v1
+    timeout: 180
+
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    timeout: 120
+    headers:
+      X-Title: llm-proxy
+
+  # Any other OpenAI-compatible service, e.g. a free AI proxy:
+  # freeproxy:
+  #   base_url: https://api.example.com/v1
+  #   api_key_env: FREEPROXY_API_KEY
+  #   timeout: 120
+
+models:
+  gemma-local:
+    provider: local
+    model: gemma-4-e4b
+    description: Gemma 4 E4B on hawk (GTX 1660 SUPER) — private, LAN only
+
+  # Example external model with automatic fallback to the local one.
+  # Check the provider's model list for current ids (free ids change often).
+  deepseek-free:
+    provider: openrouter
+    model: deepseek/deepseek-chat-v3-0324:free
+    fallback: gemma-local
+    description: DeepSeek via OpenRouter free tier — prompts leave the LAN
+
+  # A model without tool-calling support: proxied as-is, no server tools.
+  # some-chat-model:
+  #   provider: freeproxy
+  #   model: vendor/model-name
+  #   tools: false
+  #   fallback: gemma-local

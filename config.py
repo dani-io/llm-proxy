@@ -16,6 +16,12 @@ SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searx.bp:8080")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "info")
+RELOAD = os.getenv("RELOAD", "false").lower() in ("1", "true", "yes")
+
+# Providers / models (see providers.example.yaml). If the file is missing,
+# a single local model is built from LLAMA_URL / LLAMA_MODEL above.
+PROVIDERS_FILE = os.getenv(
+    "PROVIDERS_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "providers.yaml"))
 
 # Behavior
 MAX_TOOL_LOOPS = int(os.getenv("MAX_TOOL_LOOPS", "5"))
