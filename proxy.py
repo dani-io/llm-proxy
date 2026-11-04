@@ -12,6 +12,7 @@ Design:
   - On upstream failure (network, 429, 5xx, bad key…) the request moves to
     the model's `fallback` and stays there for the rest of the request
   - Streaming streams every turn live; tool-call turns are executed silently
+  - Every request is logged (metadata only) for the admin panel (admin.py)
 """
 import json
 import logging
@@ -23,7 +24,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import config
-from providers import Model, load_registry
+import health
+from providers import Model, get_registry
+from stats import store
 from tools import fetch_url, web_search
 
 
@@ -44,9 +47,7 @@ SERVER_TOOLS_SCHEMA = [t["schema"] for t in TOOLS.values()]
 BUDGET_MSG = ("You have used all tool call budget. Provide your final answer "
               "now based on the information gathered so far.")
 
-registry = load_registry()
-
-app = FastAPI(title="llm-proxy", version="0.2.0")
+app = FastAPI(title="llm-proxy", version="0.3.0")
 
 
 class UpstreamError(Exception):
@@ -55,38 +56,73 @@ class UpstreamError(Exception):
         self.model, self.status, self.detail = model, status, detail
 
 
+# ─── Per-request record (written to the stats DB at the end) ───
+class Rec:
+    def __init__(self, requested, stream, client, source="api"):
+        self.t0 = time.monotonic()
+        self.d = {"ts": time.time(), "requested": requested, "stream": int(bool(stream)),
+                  "status": "ok", "fallback": 0, "prompt_tokens": 0,
+                  "completion_tokens": 0, "turns": 0, "tool_calls": 0,
+                  "client": client, "source": source}
+        self.tools: list[str] = []
+        self.first_model: str | None = None
+
+    def served_by(self, model: Model) -> None:
+        if self.first_model is None:
+            self.first_model = model.alias
+        if model.alias != self.first_model:
+            self.d["fallback"] = 1
+        self.d["model"], self.d["provider"] = model.alias, model.provider.name
+
+    def add_usage(self, usage: dict | None) -> None:
+        if usage:
+            self.d["prompt_tokens"] += int(usage.get("prompt_tokens") or 0)
+            self.d["completion_tokens"] += int(usage.get("completion_tokens") or 0)
+
+    def first_token(self) -> None:
+        if self.d.get("ttft_ms") is None:
+            self.d["ttft_ms"] = int((time.monotonic() - self.t0) * 1000)
+
+    def fail(self, err: str) -> None:
+        self.d["status"], self.d["error"] = "error", err[:500]
+
+    def save(self) -> None:
+        self.d["latency_ms"] = int((time.monotonic() - self.t0) * 1000)
+        self.d["tools"] = ",".join(self.tools) or None
+        try:
+            store().log_request(self.d)
+        except Exception:
+            log.exception("could not write request log")
+
+
 # ─── Info endpoints ───────────────────────────────────────────
+@app.on_event("startup")
+async def _startup():
+    get_registry()
+    store()
+
+
 @app.get("/health")
-async def health():
+async def health_endpoint():
+    reg = get_registry()
+    return {"status": "ok", "tools": list(TOOLS),
+            "default_model": reg.default_model, "models": list(reg.models)}
+
+
+def model_info(m: Model, default: str) -> dict:
     return {
-        "status": "ok",
-        "tools": list(TOOLS),
-        "default_model": registry.default_model,
-        "models": list(registry.models),
+        "id": m.alias, "object": "model", "created": 0,
+        "owned_by": m.provider.name, "upstream_model": m.upstream_model,
+        "tools": m.tools, "external": m.external, "fallback": m.fallback,
+        "default": m.alias == default, "description": m.description,
     }
 
 
 @app.get("/v1/models")
 async def list_models():
-    now = int(time.time())
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": m.alias,
-                "object": "model",
-                "created": now,
-                "owned_by": m.provider.name,
-                "upstream_model": m.upstream_model,
-                "tools": m.tools,
-                "external": m.external,
-                "fallback": m.fallback,
-                "default": m.alias == registry.default_model,
-                "description": m.description,
-            }
-            for m in registry.models.values()
-        ],
-    }
+    reg = get_registry()
+    return {"object": "list",
+            "data": [model_info(m, reg.default_model) for m in reg.models.values()]}
 
 
 # ─── Helpers ──────────────────────────────────────────────────
@@ -112,6 +148,8 @@ def build_payload(model: Model, body: dict, messages: list, tools: list, stream:
         payload["tools"] = tools
         if "tool_choice" in body:
             payload["tool_choice"] = body["tool_choice"]
+    if stream and model.provider.stream_usage:
+        payload["stream_options"] = {**(body.get("stream_options") or {}), "include_usage": True}
     return payload
 
 
@@ -122,12 +160,15 @@ def clean_assistant_msg(msg: dict) -> dict:
             "tool_calls": msg.get("tool_calls") or []}
 
 
-async def execute_tool_call(tool_call: dict) -> dict:
+async def execute_tool_call(tool_call: dict, rec: Rec) -> dict:
     call_id = tool_call.get("id") or "call_" + uuid.uuid4().hex[:12]
     fn = tool_call.get("function", {})
     name = fn.get("name", "")
     raw_args = fn.get("arguments") or "{}"
     log.info("tool_call: %s(%s)", name, str(raw_args)[:200])
+    rec.d["tool_calls"] += 1
+    if name not in rec.tools:
+        rec.tools.append(name)
 
     try:
         args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
@@ -146,23 +187,28 @@ async def execute_tool_call(tool_call: dict) -> dict:
 # ─── Upstream calls ───────────────────────────────────────────
 async def post_chat(model: Model, payload: dict) -> dict:
     url = f"{model.provider.base_url}/chat/completions"
+    t0 = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=model.provider.timeout) as client:
             resp = await client.post(url, json=payload, headers=model.provider.request_headers())
     except httpx.HTTPError as e:
+        health.error(model.provider.name, model.alias, None, f"{type(e).__name__}: {e}")
         raise UpstreamError(model, 502, f"{type(e).__name__}: {e}") from e
     if resp.status_code >= 400:
+        health.error(model.provider.name, model.alias, resp.status_code, resp.text)
         raise UpstreamError(model, resp.status_code, resp.text)
     try:
         data = resp.json()
         data["choices"][0]["message"]
     except (ValueError, KeyError, IndexError, TypeError):
+        health.error(model.provider.name, model.alias, resp.status_code, "malformed response")
         raise UpstreamError(model, 502, f"malformed response: {resp.text[:300]}")
+    health.ok(model.provider.name, model.alias, int((time.monotonic() - t0) * 1000))
     return data
 
 
-async def call_chain(chain: list[Model], body: dict, messages: list,
-                     client_tools: list, force_no_tools: bool = False):
+async def call_chain(chain: list[Model], body: dict, messages: list, client_tools: list,
+                     rec: Rec, force_no_tools: bool = False):
     """Try each model in the chain; return (index, response, server_tool_names)."""
     last_err = None
     for i, model in enumerate(chain):
@@ -171,21 +217,25 @@ async def call_chain(chain: list[Model], body: dict, messages: list,
             data = await post_chat(model, build_payload(model, body, messages, tools, False))
             if i:
                 log.warning("served by fallback %s", model.alias)
+            rec.served_by(model)
+            rec.d["turns"] += 1
+            rec.add_usage(data.get("usage"))
             return i, data, server_names
         except UpstreamError as e:
             log.warning("upstream failed: %s", e)
+            rec.served_by(model)
             last_err = e
     raise last_err
 
 
 # ─── Non-streaming ────────────────────────────────────────────
-async def handle_non_stream(body: dict, chain: list[Model]):
+async def handle_non_stream(body: dict, chain: list[Model], rec: Rec):
     messages = list(body.get("messages", []))
     client_tools = body.get("tools") or []
 
     for loop in range(config.MAX_TOOL_LOOPS):
         log.info("loop %d/%d [%s]", loop + 1, config.MAX_TOOL_LOOPS, chain[0].alias)
-        i, resp, server_names = await call_chain(chain, body, messages, client_tools)
+        i, resp, server_names = await call_chain(chain, body, messages, client_tools, rec)
         chain = chain[i:]                       # sticky fallback
         resp["model"] = chain[0].alias
 
@@ -198,15 +248,16 @@ async def handle_non_stream(body: dict, chain: list[Model]):
         names = {tc.get("function", {}).get("name") for tc in tool_calls}
         if not names <= server_names:
             log.info("client tool call(s) %s -> returned to client", names - server_names)
+            rec.d["status"] = "client_tool"
             return resp
 
         messages.append(clean_assistant_msg(msg))
         for tc in tool_calls:
-            messages.append(await execute_tool_call(tc))
+            messages.append(await execute_tool_call(tc, rec))
 
     log.warning("MAX_TOOL_LOOPS reached, forcing final answer")
     messages.append({"role": "user", "content": BUDGET_MSG})
-    i, resp, _ = await call_chain(chain, body, messages, client_tools, force_no_tools=True)
+    i, resp, _ = await call_chain(chain, body, messages, client_tools, rec, force_no_tools=True)
     resp["model"] = chain[i].alias
     return resp
 
@@ -216,108 +267,134 @@ def sse(obj) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-async def handle_stream(body: dict, chain: list[Model]):
+async def handle_stream(body: dict, chain: list[Model], rec: Rec):
     """Every turn is streamed from upstream. Content chunks go to the client
     live; tool-call chunks are held back. If all held calls are server tools
     they are executed and the loop continues; otherwise they are flushed to
     the client (client tools)."""
+    client_wants_usage = bool((body.get("stream_options") or {}).get("include_usage"))
 
     async def gen():
         nonlocal chain
         messages = list(body.get("messages", []))
         client_tools = body.get("tools") or []
+        try:
+            for loop in range(config.MAX_TOOL_LOOPS + 1):
+                final_turn = loop == config.MAX_TOOL_LOOPS
+                if final_turn:
+                    log.warning("MAX_TOOL_LOOPS reached, forcing final answer")
+                    messages.append({"role": "user", "content": BUDGET_MSG})
 
-        for loop in range(config.MAX_TOOL_LOOPS + 1):
-            final_turn = loop == config.MAX_TOOL_LOOPS
-            if final_turn:
-                log.warning("MAX_TOOL_LOOPS reached, forcing final answer")
-                messages.append({"role": "user", "content": BUDGET_MSG})
+                opened = False
+                for i, model in enumerate(chain):
+                    tools, server_names = ([], set()) if final_turn else merge_tools(model, client_tools)
+                    payload = build_payload(model, body, messages, tools, True)
+                    acc: dict[int, dict] = {}   # index -> accumulated tool call
+                    held: list[str] = []        # raw tool-call chunks, flushed only for client tools
+                    sent_any = False
+                    t0 = time.monotonic()
+                    rec.served_by(model)
+                    try:
+                        async with httpx.AsyncClient(timeout=model.provider.timeout) as client:
+                            async with client.stream(
+                                "POST", f"{model.provider.base_url}/chat/completions",
+                                json=payload, headers=model.provider.request_headers(),
+                            ) as resp:
+                                if resp.status_code >= 400:
+                                    detail = (await resp.aread()).decode(errors="replace")
+                                    raise UpstreamError(model, resp.status_code, detail)
+                                opened = True
+                                chain = chain[i:]
+                                rec.d["turns"] += 1
+                                if i:
+                                    log.warning("served by fallback %s", model.alias)
+                                log.info("stream turn %d [%s]", loop + 1, model.alias)
 
-            opened = False
-            for i, model in enumerate(chain):
-                tools, server_names = ([], set()) if final_turn else merge_tools(model, client_tools)
-                payload = build_payload(model, body, messages, tools, True)
-                acc: dict[int, dict] = {}       # index -> accumulated tool call
-                held: list[str] = []            # raw tool-call chunks, flushed only for client tools
-                sent_any = False
-                try:
-                    async with httpx.AsyncClient(timeout=model.provider.timeout) as client:
-                        async with client.stream(
-                            "POST", f"{model.provider.base_url}/chat/completions",
-                            json=payload, headers=model.provider.request_headers(),
-                        ) as resp:
-                            if resp.status_code >= 400:
-                                detail = (await resp.aread()).decode(errors="replace")
-                                raise UpstreamError(model, resp.status_code, detail)
-                            opened = True
-                            chain = chain[i:]
-                            if i:
-                                log.warning("served by fallback %s", model.alias)
-                            log.info("stream turn %d [%s]", loop + 1, model.alias)
+                                async for line in resp.aiter_lines():
+                                    if not line.startswith("data:"):
+                                        continue
+                                    data = line[5:].strip()
+                                    if data == "[DONE]":
+                                        break
+                                    try:
+                                        chunk = json.loads(data)
+                                    except ValueError:
+                                        continue
+                                    chunk["model"] = model.alias
+                                    choices = chunk.get("choices") or []
+                                    if chunk.get("usage"):
+                                        rec.add_usage(chunk["usage"])
+                                        if not choices:     # usage-only chunk
+                                            if client_wants_usage:
+                                                yield sse(chunk)
+                                            continue
+                                        if not client_wants_usage:
+                                            chunk.pop("usage")
+                                    delta = (choices[0].get("delta") or {}) if choices else {}
+                                    finish = choices[0].get("finish_reason") if choices else None
 
-                            async for line in resp.aiter_lines():
-                                if not line.startswith("data:"):
-                                    continue
-                                data = line[5:].strip()
-                                if data == "[DONE]":
-                                    break
-                                try:
-                                    chunk = json.loads(data)
-                                except ValueError:
-                                    continue
-                                chunk["model"] = model.alias
-                                choices = chunk.get("choices") or []
-                                delta = (choices[0].get("delta") or {}) if choices else {}
-                                finish = choices[0].get("finish_reason") if choices else None
+                                    if delta.get("tool_calls"):
+                                        for tc in delta["tool_calls"]:
+                                            slot = acc.setdefault(tc.get("index", 0), {
+                                                "id": None, "type": "function",
+                                                "function": {"name": "", "arguments": ""}})
+                                            if tc.get("id"):
+                                                slot["id"] = tc["id"]
+                                            f = tc.get("function") or {}
+                                            slot["function"]["name"] += f.get("name") or ""
+                                            slot["function"]["arguments"] += f.get("arguments") or ""
+                                        held.append(sse(chunk))
+                                        continue
+                                    if finish == "tool_calls" or (acc and finish):
+                                        held.append(sse(chunk))
+                                        continue
+                                    if delta.get("content"):
+                                        rec.first_token()
+                                    sent_any = True
+                                    yield sse(chunk)
+                        health.ok(model.provider.name, model.alias,
+                                  int((time.monotonic() - t0) * 1000))
+                        break                   # this turn is done
+                    except (UpstreamError, httpx.HTTPError) as e:
+                        log.warning("upstream failed (stream): %s", e)
+                        health.error(model.provider.name, model.alias,
+                                     getattr(e, "status", None), str(e))
+                        if sent_any:            # can't switch provider mid-answer
+                            rec.fail(f"stream broke: {e}")
+                            yield sse({"error": {"message": f"upstream stream broke: {e}"}})
+                            yield "data: [DONE]\n\n"
+                            return
+                        rec.d.setdefault("error", str(e)[:500])
+                        opened = False
+                        continue
 
-                                if delta.get("tool_calls"):
-                                    for tc in delta["tool_calls"]:
-                                        slot = acc.setdefault(tc.get("index", 0), {
-                                            "id": None, "type": "function",
-                                            "function": {"name": "", "arguments": ""}})
-                                        if tc.get("id"):
-                                            slot["id"] = tc["id"]
-                                        f = tc.get("function") or {}
-                                        slot["function"]["name"] += f.get("name") or ""
-                                        slot["function"]["arguments"] += f.get("arguments") or ""
-                                    held.append(sse(chunk))
-                                    continue
-                                if finish == "tool_calls" or (acc and finish):
-                                    held.append(sse(chunk))
-                                    continue
-                                sent_any = True
-                                yield sse(chunk)
-                    break                       # this turn is done
-                except (UpstreamError, httpx.HTTPError) as e:
-                    log.warning("upstream failed (stream): %s", e)
-                    if sent_any:                # can't switch provider mid-answer
-                        yield sse({"error": {"message": f"upstream stream broke: {e}"}})
-                        yield "data: [DONE]\n\n"
-                        return
-                    opened = False
-                    continue
+                if not opened:
+                    rec.fail(rec.d.get("error") or "all upstream models failed")
+                    yield sse({"error": {"message": "all upstream models failed",
+                                         "models": [m.alias for m in chain]}})
+                    yield "data: [DONE]\n\n"
+                    return
 
-            if not opened:
-                yield sse({"error": {"message": "all upstream models failed",
-                                     "models": [m.alias for m in chain]}})
-                yield "data: [DONE]\n\n"
-                return
+                if not acc:
+                    break                       # final answer streamed
+                calls = [acc[k] for k in sorted(acc)]
+                names = {c["function"]["name"] for c in calls}
+                if not names <= server_names:
+                    log.info("client tool call(s) %s -> returned to client", names - server_names)
+                    rec.d["status"] = "client_tool"
+                    for h in held:
+                        yield h
+                    break
 
-            if not acc:
-                break                           # final answer streamed
-            calls = [acc[k] for k in sorted(acc)]
-            names = {c["function"]["name"] for c in calls}
-            if not names <= server_names:
-                log.info("client tool call(s) %s -> returned to client", names - server_names)
-                for h in held:
-                    yield h
-                break
+                messages.append({"role": "assistant", "content": "", "tool_calls": calls})
+                for c in calls:
+                    messages.append(await execute_tool_call(c, rec))
 
-            messages.append({"role": "assistant", "content": "", "tool_calls": calls})
-            for c in calls:
-                messages.append(await execute_tool_call(c))
-
-        yield "data: [DONE]\n\n"
+            if rec.d["status"] != "error":
+                rec.d.pop("error", None)        # errors that a fallback recovered from
+            yield "data: [DONE]\n\n"
+        finally:
+            rec.save()
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -326,28 +403,28 @@ async def handle_stream(body: dict, chain: list[Model]):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
-    model = registry.resolve(body.get("model"))
-    chain = registry.fallback_chain(model)
+    reg = get_registry()
+    model = reg.resolve(body.get("model"))
+    chain = reg.fallback_chain(model)
+    rec = Rec(body.get("model"), body.get("stream"),
+              request.client.host if request.client else None)
 
     if body.get("stream"):
-        return await handle_stream(body, chain)
+        return await handle_stream(body, chain, rec)
     try:
-        return JSONResponse(await handle_non_stream(body, chain))
+        return JSONResponse(await handle_non_stream(body, chain, rec))
     except UpstreamError as e:
+        rec.fail(str(e))
         status = e.status if 400 <= e.status < 600 else 502
         return JSONResponse(
             {"error": {"message": str(e), "model": e.model.alias,
                        "tried": [m.alias for m in chain]}},
             status_code=status,
         )
+    finally:
+        rec.save()
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "proxy:app",
-        host=config.HOST,
-        port=config.PORT,
-        reload=config.RELOAD,
-        log_level=config.LOG_LEVEL,
-    )
+    import server
+    server.run()

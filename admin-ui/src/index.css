@@ -1,0 +1,23 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Vazirmatn,
+    'Noto Sans Arabic', Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  @apply bg-slate-50 text-slate-900 antialiased;
+}
+
+/* Message bodies carry dir="auto" so Persian renders RTL; preserve author
+   line breaks and never let a long unbroken string blow out the layout. */
+.msg-body {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}

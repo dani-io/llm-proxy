@@ -25,6 +25,7 @@ class Provider:
     api_key: str | None = None
     timeout: float = 120.0
     headers: dict = field(default_factory=dict)
+    stream_usage: bool = True          # send stream_options.include_usage
 
     def request_headers(self) -> dict:
         h = dict(self.headers)
@@ -109,6 +110,7 @@ def load_registry(path: str | None = None) -> Registry:
             api_key=key,
             timeout=float(p.get("timeout", 120)),
             headers=p.get("headers") or {},
+            stream_usage=bool(p.get("stream_usage", True)),
         )
 
     models: dict[str, Model] = {}
@@ -140,6 +142,17 @@ def load_registry(path: str | None = None) -> Registry:
     log.info("loaded %d provider(s), %d model(s), default=%s: %s",
              len(providers), len(models), default, ", ".join(models))
     return Registry(providers, models, default)
+
+
+_registry: Registry | None = None
+
+
+def get_registry() -> Registry:
+    """Process-wide registry shared by the proxy and the admin app."""
+    global _registry
+    if _registry is None:
+        _registry = load_registry()
+    return _registry
 
 
 def _is_lan(url: str) -> bool:

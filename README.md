@@ -19,6 +19,26 @@ OpenAI-compatible API, with server-side tool calling.
 - **True streaming** — every turn is streamed live; tool-call turns are run
   silently, and no answer is generated twice.
 
+## Admin panel
+
+Served by the same process on `ADMIN_PORT` (default **8002**), separate from
+the model API:
+
+- **Dashboard** — today's requests, errors, tokens, latency; model and provider health
+- **Models** — health, usage, and a one-click test call per model
+- **Providers** — health, key hint, and *Check now* (`GET /models`, no quota) with
+  a searchable list of upstream model ids
+- **Usage** — requests per model and tokens over 24h / 7d / 30d / 90d
+- **Requests** — the request log (metadata only — prompts are never stored)
+
+The first visit creates the single admin account. Data lives in
+`data/stats.db` (SQLite, 90-day retention). Health comes from real traffic
+plus a probe every 5 minutes.
+
+The UI source is in `admin-ui/` (React + Vite + Tailwind, same style as
+sms-panel). The built `admin-ui/dist` is committed, so the server needs no
+Node. After UI changes: `cd admin-ui && npm install && npm run build`.
+
 ## Setup
 
 ```bash
@@ -27,7 +47,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 cp providers.example.yaml providers.yaml   # optional — without it only LLAMA_URL is used
-python proxy.py
+python server.py      # model API on PORT, admin panel on ADMIN_PORT
 ```
 
 API keys go in `.env` (e.g. `OPENROUTER_API_KEY=...`) and are referenced from

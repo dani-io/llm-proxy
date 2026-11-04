@@ -7,3 +7,6 @@ __pycache__/
 .DS_Store
 .pytest_cache/
 providers.yaml
+data/
+*.db
+admin-ui/node_modules/

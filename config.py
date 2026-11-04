@@ -18,6 +18,18 @@ PORT = int(os.getenv("PORT", "8000"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "info")
 RELOAD = os.getenv("RELOAD", "false").lower() in ("1", "true", "yes")
 
+# Admin panel (served on its own port; set ADMIN_PORT=0 to disable)
+ADMIN_HOST = os.getenv("ADMIN_HOST", "0.0.0.0")
+ADMIN_PORT = int(os.getenv("ADMIN_PORT", "8002"))
+SESSION_TTL_HOURS = float(os.getenv("SESSION_TTL_HOURS", "168"))
+PANEL_TZ = os.getenv("PANEL_TZ", "Asia/Tehran")          # day boundaries in stats
+
+# Request log (metadata only — no prompts) and provider health probe
+STATS_DB = os.getenv(
+    "STATS_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "stats.db"))
+STATS_RETENTION_DAYS = int(os.getenv("STATS_RETENTION_DAYS", "90"))
+HEALTH_PROBE_SECONDS = int(os.getenv("HEALTH_PROBE_SECONDS", "300"))   # 0 = off
+
 # Providers / models (see providers.example.yaml). If the file is missing,
 # a single local model is built from LLAMA_URL / LLAMA_MODEL above.
 PROVIDERS_FILE = os.getenv(
