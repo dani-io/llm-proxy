@@ -30,6 +30,10 @@ STATS_DB = os.getenv(
 STATS_RETENTION_DAYS = int(os.getenv("STATS_RETENTION_DAYS", "90"))
 HEALTH_PROBE_SECONDS = int(os.getenv("HEALTH_PROBE_SECONDS", "300"))   # 0 = off
 
+# API keys entered in the admin panel (own file, 0600; .env is never rewritten)
+KEYS_FILE = os.getenv(
+    "KEYS_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "provider-keys.env"))
+
 # Providers / models (see providers.example.yaml). If the file is missing,
 # a single local model is built from LLAMA_URL / LLAMA_MODEL above.
 PROVIDERS_FILE = os.getenv(

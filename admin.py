@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import admin_config
 import config
 import health
 import proxy
@@ -269,6 +270,9 @@ async def probe_provider(name: str):
     if not p:
         raise HTTPException(404, f"Unknown provider {name}")
     return await health.probe(p)
+
+
+admin_app.include_router(admin_config.router, dependencies=[Depends(require_admin)])
 
 
 # ─── UI ───────────────────────────────────────────────────────

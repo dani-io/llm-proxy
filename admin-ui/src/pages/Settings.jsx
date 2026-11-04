@@ -23,8 +23,22 @@ export default function Settings({ session, onLoggedOut }) {
   const [repeat, setRepeat] = useState('')
   const [busy, setBusy] = useState(false)
   const toast = useToast()
-  const { data } = useApiData(() => api.overview())
+  const { data, reload } = useApiData(() => api.overview())
   const px = data?.proxy
+  const [reloading, setReloading] = useState(false)
+
+  const reloadConfig = async () => {
+    setReloading(true)
+    try {
+      const cfg = await api.reloadConfig()
+      toast.success(`Reloaded — ${cfg.models.filter((m) => m.active).length} active model(s)`)
+      reload({ silent: true })
+    } catch (err) {
+      toast.error(err.message)
+    } finally {
+      setReloading(false)
+    }
+  }
 
   const mismatch = repeat && next !== repeat
   const tooShort = next && next.length < MIN_PASSWORD
@@ -53,10 +67,14 @@ export default function Settings({ session, onLoggedOut }) {
       <Card className="max-w-2xl p-5 sm:p-6">
         <h2 className="text-sm font-semibold text-slate-900">Configuration</h2>
         <p className="mt-1 text-sm text-slate-500">
-          Read-only in this version. Providers and models live in{' '}
-          <Code>providers.yaml</Code>, API keys in <Code>.env</Code> — edit them on CT 261 and run{' '}
-          <Code>systemctl restart llm-proxy</Code>.
+          Providers and models are edited on their pages and saved to <Code>providers.yaml</Code>{' '}
+          (a backup is kept in <Code>data/backups/</Code>; comments in the file are not preserved).
+          Keys set in the panel go to <Code>data/provider-keys.env</Code> and take priority over <Code>.env</Code>.
+          After editing the file by hand, reload it here — no restart needed.
         </p>
+        <Button variant="secondary" className="mt-4" onClick={reloadConfig} loading={reloading}>
+          Reload from disk
+        </Button>
         <dl className="mt-4 divide-y divide-slate-100">
           <Row label="Providers file">
             <Code>{px?.providers_file ?? '…'}</Code>

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 import yaml
 
 import config
+import keystore
 
 log = logging.getLogger("llm-proxy.providers")
 
@@ -46,10 +47,14 @@ class Model:
 
 
 class Registry:
-    def __init__(self, providers: dict, models: dict, default_model: str):
+    def __init__(self, providers: dict, models: dict, default_model: str,
+                 skipped: dict | None = None, legacy: bool = False):
         self.providers = providers
         self.models = models
         self.default_model = default_model
+        # name -> reason, for entries in providers.yaml that could not be used
+        self.skipped = skipped or {"providers": {}, "models": {}}
+        self.legacy = legacy
 
     def resolve(self, requested: str | None) -> Model:
         """Return the model for an alias; unknown/missing -> default model."""
@@ -83,6 +88,7 @@ def _legacy_registry() -> Registry:
         providers={"local": local},
         models={alias: Model(alias=alias, provider=local, upstream_model=alias)},
         default_model=alias,
+        legacy=True,
     )
 
 
@@ -95,14 +101,16 @@ def load_registry(path: str | None = None) -> Registry:
     with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
 
+    skipped: dict = {"providers": {}, "models": {}}
     providers: dict[str, Provider] = {}
     for name, p in (raw.get("providers") or {}).items():
         key = None
         if p.get("api_key_env"):
-            key = os.getenv(p["api_key_env"])
+            key, _ = keystore.get(p["api_key_env"])
             if not key:
-                log.warning("provider %r: env %s is empty — its models are skipped",
+                log.warning("provider %r: no key in %s — its models are skipped",
                             name, p["api_key_env"])
+                skipped["providers"][name] = f"no API key ({p['api_key_env']} is empty)"
                 continue
         providers[name] = Provider(
             name=name,
@@ -118,6 +126,7 @@ def load_registry(path: str | None = None) -> Registry:
         prov = providers.get(m.get("provider"))
         if not prov:
             log.warning("model %r: provider %r unavailable — skipped", alias, m.get("provider"))
+            skipped["models"][alias] = f"provider {m.get('provider')!r} is inactive"
             continue
         models[alias] = Model(
             alias=alias,
@@ -131,7 +140,9 @@ def load_registry(path: str | None = None) -> Registry:
 
     if not models:
         log.error("no usable models in %s — falling back to legacy config", path)
-        return _legacy_registry()
+        reg = _legacy_registry()
+        reg.skipped = skipped
+        return reg
 
     default = raw.get("default_model") or next(iter(models))
     if default not in models:
@@ -141,7 +152,7 @@ def load_registry(path: str | None = None) -> Registry:
 
     log.info("loaded %d provider(s), %d model(s), default=%s: %s",
              len(providers), len(models), default, ", ".join(models))
-    return Registry(providers, models, default)
+    return Registry(providers, models, default, skipped)
 
 
 _registry: Registry | None = None
@@ -152,6 +163,14 @@ def get_registry() -> Registry:
     global _registry
     if _registry is None:
         _registry = load_registry()
+    return _registry
+
+
+def reload_registry() -> Registry:
+    """Re-read providers.yaml and keys. Requests already running keep the
+    models they started with; new requests use the new registry."""
+    global _registry
+    _registry = load_registry()
     return _registry
 
 

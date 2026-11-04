@@ -94,6 +94,19 @@ export const api = {
       body: prompt ? { prompt } : {},
       timeout: 200000,
     }),
+  // ── Config (phase 2): every call returns the full config view ──
+  config: () => request('/config'),
+  reloadConfig: () => request('/config/reload', { method: 'POST' }),
+  saveProvider: (name, body) =>
+    request(`/config/providers/${encodeURIComponent(name)}`, { method: 'PUT', body }),
+  deleteProvider: (name) => request(`/config/providers/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  // Empty key removes it. Keys are write-only: the API only ever returns a hint.
+  setKey: (name, key) =>
+    request(`/config/providers/${encodeURIComponent(name)}/key`, { method: 'PUT', body: { key } }),
+  saveModel: (alias, body) => request(`/config/models/${encodeURIComponent(alias)}`, { method: 'PUT', body }),
+  deleteModel: (alias) => request(`/config/models/${encodeURIComponent(alias)}`, { method: 'DELETE' }),
+  setDefault: (model) => request('/config/default', { method: 'PUT', body: { model } }),
+
   probeProvider: (name) =>
     request(`/providers/${encodeURIComponent(name)}/probe`, { method: 'POST', timeout: 30000 }),
 }
