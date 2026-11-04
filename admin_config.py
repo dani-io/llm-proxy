@@ -103,6 +103,7 @@ async def delete_provider(name: str):
                 p.get("api_key_env") == env for p in raw["providers"].values()):
             keystore.set_key(env, None)
         health.providers.pop(name, None)
+        health.last_probe.pop(name, None)
         return result
 
 
@@ -121,6 +122,7 @@ async def put_key(name: str, body: KeyBody):
             p["api_key_env"] = env
         try:
             keystore.set_key(env, body.key or None)
+            health.last_probe.pop(name, None)     # list may differ per key
             return cs.save(raw)        # writes api_key_env if new, and reloads
         except (cs.ConfigError, ValueError) as e:
             _fail(e)

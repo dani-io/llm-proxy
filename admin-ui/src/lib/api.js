@@ -107,6 +107,9 @@ export const api = {
   deleteModel: (alias) => request(`/config/models/${encodeURIComponent(alias)}`, { method: 'DELETE' }),
   setDefault: (model) => request('/config/default', { method: 'PUT', body: { model } }),
 
-  probeProvider: (name) =>
-    request(`/providers/${encodeURIComponent(name)}/probe`, { method: 'POST', timeout: 30000 }),
+  probeProvider: (name, maxAge = 0) =>
+    request(`/providers/${encodeURIComponent(name)}/probe${maxAge ? `?max_age=${maxAge}` : ''}`, {
+      method: 'POST',
+      timeout: 30000,
+    }),
 }

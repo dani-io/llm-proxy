@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api } from '../lib/api'
 import { useToast } from './toast-context'
 import { Modal } from './Modal'
@@ -162,11 +162,89 @@ export function KeyForm({ provider, onClose, onSaved }) {
   )
 }
 
+// ─── Upstream model picker ───────────────────────────────────
+/** Free-text input plus a searchable list loaded from the provider's
+ * /models (cached 5 min on the server). Typing any id is still allowed —
+ * some providers serve models they do not list. */
+function UpstreamPicker({ provider, active, value, onChange, onPick, inUse }) {
+  const [state, setState] = useState({ status: 'idle', ids: [], error: '' })
+  const [open, setOpen] = useState(false)
+
+  const load = async (fresh = false) => {
+    if (!provider || !active) {
+      setState({ status: 'idle', ids: [], error: '' })
+      return
+    }
+    setState((s) => ({ ...s, status: 'loading', error: '' }))
+    try {
+      const res = await api.probeProvider(provider, fresh ? 0 : 300)
+      setState(res.ok ? { status: 'ok', ids: res.models, error: '' } : { status: 'error', ids: [], error: res.error })
+    } catch (err) {
+      setState({ status: 'error', ids: [], error: err.message })
+    }
+  }
+
+  useEffect(() => {
+    load()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provider, active])
+
+  const needle = value.trim().toLowerCase()
+  const exact = state.ids.includes(value.trim())
+  const matches = needle && !exact ? state.ids.filter((id) => id.toLowerCase().includes(needle)) : state.ids
+  const showList = open && state.status === 'ok' && matches.length > 0
+
+  return (
+    <div>
+      <div className="relative">
+        <input id="md-upstream" dir="ltr" value={value} autoComplete="off" required
+          onChange={(e) => { onChange(e.target.value); setOpen(true) }}
+          onFocus={() => setOpen(true)}
+          onBlur={() => setTimeout(() => setOpen(false), 150)}
+          onKeyDown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); setOpen(false) } }}
+          placeholder={state.status === 'ok' ? `Search ${state.ids.length} models or type an id` : 'e.g. gpt-6-luna'}
+          className={`${inputClass} font-mono`} />
+        {showList && (
+          <ul className="absolute z-10 mt-1 max-h-60 w-full overflow-auto rounded-lg border border-slate-200 bg-white py-1 shadow-lg">
+            {matches.slice(0, 300).map((id) => (
+              <li key={id}>
+                <button type="button" onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => { onPick(id); setOpen(false) }}
+                  className={`flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left font-mono text-xs hover:bg-blue-50 ${id === value ? 'bg-blue-50 text-blue-700' : 'text-slate-800'}`}>
+                  <span className="truncate">{id}</span>
+                  {inUse.has(id) && <span className="shrink-0 font-sans text-[11px] text-slate-400">in use</span>}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      <p className="mt-1.5 flex flex-wrap items-center gap-x-2 text-xs text-slate-500">
+        {!active && "This provider is inactive, so its models can't be listed — type the id."}
+        {active && state.status === 'loading' && 'Loading models from the provider…'}
+        {active && state.status === 'ok' && (
+          <>
+            <span>{state.ids.length} models from {provider}{value && !exact && state.ids.length ? ' — not in the list, will be used as typed' : ''}.</span>
+            <button type="button" onClick={() => load(true)} className="font-medium text-blue-600 hover:text-blue-700">Refresh list</button>
+          </>
+        )}
+        {active && state.status === 'error' && (
+          <>
+            <span className="text-amber-700">Could not list models ({state.error}) — type the id.</span>
+            <button type="button" onClick={() => load(true)} className="font-medium text-blue-600 hover:text-blue-700">Retry</button>
+          </>
+        )}
+      </p>
+    </div>
+  )
+}
+
 // ─── Model ───────────────────────────────────────────────────
 export function ModelForm({ model, preset, config, onClose, onSaved }) {
   const editing = Boolean(model)
   const init = model ?? preset ?? {}
   const [alias, setAlias] = useState(init.alias ?? '')
+  const [aliasTouched, setAliasTouched] = useState(Boolean(init.alias))
   const [provider, setProvider] = useState(init.provider ?? config.providers[0]?.name ?? '')
   const [upstream, setUpstream] = useState(init.model ?? '')
   const [tools, setTools] = useState(init.tools ?? true)
@@ -196,16 +274,21 @@ export function ModelForm({ model, preset, config, onClose, onSaved }) {
         </>
       }>
       <form id="model-form" onSubmit={submit} className="space-y-4">
-        <Field label="Name clients use" htmlFor="md-alias" error={aliasErr || taken} hint={editing ? 'Names cannot be changed.' : 'Sent as "model" in requests, e.g. luna.'}>
-          <input id="md-alias" dir="ltr" value={alias} onChange={(e) => setAlias(e.target.value)} disabled={editing} autoFocus={!editing && !preset} required className={inputClass} />
-        </Field>
         <Field label="Provider" htmlFor="md-provider" hint={prov && !prov.active ? 'This provider is inactive (no API key) — the model will be inactive until it has one.' : undefined}>
           <select id="md-provider" value={provider} onChange={(e) => setProvider(e.target.value)} className={inputClass}>
             {config.providers.map((p) => <option key={p.name} value={p.name}>{p.name}{p.active ? '' : ' (inactive)'}</option>)}
           </select>
         </Field>
-        <Field label="Upstream model id" htmlFor="md-upstream" hint="The provider's own id — on the Providers page, Check now lists them.">
-          <input id="md-upstream" dir="ltr" value={upstream} onChange={(e) => setUpstream(e.target.value)} autoFocus={Boolean(preset)} required className={`${inputClass} font-mono`} />
+        <Field label="Upstream model id" htmlFor="md-upstream">
+          <UpstreamPicker provider={provider} active={Boolean(prov?.active)} value={upstream} onChange={setUpstream}
+            inUse={new Set(config.models.filter((m) => m.provider === provider && m.alias !== model?.alias).map((m) => m.model))}
+            onPick={(id) => {
+              setUpstream(id)
+              if (!editing && !aliasTouched) setAlias(suggestAlias(id))
+            }} />
+        </Field>
+        <Field label="Name clients use" htmlFor="md-alias" error={aliasErr || taken} hint={editing ? 'Names cannot be changed.' : 'Sent as "model" in requests. Filled in from the upstream id — change it to something short, e.g. luna.'}>
+          <input id="md-alias" dir="ltr" value={alias} onChange={(e) => { setAlias(e.target.value); setAliasTouched(Boolean(e.target.value)) }} disabled={editing}  required className={inputClass} />
         </Field>
         <Field label="Fallback" htmlFor="md-fallback" hint="Used automatically when this model fails (network, rate limit, bad key…).">
           <select id="md-fallback" value={fallback} onChange={(e) => setFallback(e.target.value)} className={inputClass}>

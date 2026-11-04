@@ -45,6 +45,7 @@ class State:
 
 providers: dict[str, State] = {}
 models: dict[str, State] = {}
+last_probe: dict[str, dict] = {}     # provider -> last probe result (with ts)
 
 
 def _get(table: dict, key: str) -> State:
@@ -82,7 +83,9 @@ async def probe(provider) -> dict:
         ok(provider.name, None, ms)
         s = _get(providers, provider.name)
         s.probe_models, s.last_probe = len(ids), time.time()
-        return {"ok": True, "latency_ms": ms, "count": len(ids), "models": ids}
+        result = {"ok": True, "latency_ms": ms, "count": len(ids), "models": ids, "ts": time.time()}
+        last_probe[provider.name] = result
+        return result
     except Exception as e:
         ms = int((time.monotonic() - t0) * 1000)
         msg = f"{type(e).__name__}: {e}"

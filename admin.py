@@ -265,10 +265,15 @@ async def test_model(alias: str, body: TestBody):
 
 
 @admin_app.post("/api/providers/{name}/probe", dependencies=[Depends(require_admin)])
-async def probe_provider(name: str):
+async def probe_provider(name: str, max_age: int = 0):
+    """GET {base_url}/models. With max_age (seconds), a recent successful
+    result is reused — the model form uses this so opening it is instant."""
     p = get_registry().providers.get(name)
     if not p:
-        raise HTTPException(404, f"Unknown provider {name}")
+        raise HTTPException(404, f"Unknown provider {name} (or it is inactive)")
+    cached = health.last_probe.get(name)
+    if max_age and cached and time.time() - cached["ts"] <= max_age:
+        return {**cached, "cached": True}
     return await health.probe(p)
 
 
