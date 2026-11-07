@@ -68,4 +68,24 @@ conversation — are sent to that provider. Keep private data on local models.
 
 ## Deploy
 
-Production runs as systemd service `llm-proxy` in CT 261 (hawk), from `/opt/llm-proxy`.
+Production runs on **Coolify** (eagle CT 100, project *Lab*, app `llm-proxy`),
+built from the `Dockerfile` on every push to `main`.
+
+- Model API: `http://llm.bp/v1` (container port 8000)
+- Admin panel: `http://llm-admin.bp` (container port 8002)
+- Persistent volume on `/app/data`: `stats.db`, `providers.yaml`,
+  `provider-keys.env`, `backups/` — edit providers/keys from the admin panel
+- Env vars (Coolify): `LLAMA_URL`, `LLAMA_MODEL`, `SEARXNG_URL`, `PANEL_TZ`,
+  `LOG_LEVEL`, plus any `*_API_KEY` named in `providers.yaml` (as secrets)
+- One replica only: the provider registry and health state live in memory
+- `.bp` domains only — never put it under `*.blackport.ir` (public CF tunnel)
+
+Run the image locally:
+
+```bash
+docker build -t llm-proxy .
+docker run -p 8000:8000 -p 8002:8002 -v llm-proxy-data:/app/data llm-proxy
+```
+
+Until Nov 2026 it ran as systemd service `llm-proxy` in CT 261 on hawk
+(`/opt/llm-proxy`); that CT is stopped and kept for rollback.
