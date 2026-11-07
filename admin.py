@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import admin_config
+import admin_keys
 import config
 import health
 import proxy
@@ -221,8 +222,10 @@ async def stats_models(days: int = 7):
 
 @admin_app.get("/api/requests", dependencies=[Depends(require_admin)])
 async def requests_log(limit: int = 50, before_id: int | None = None,
-                       model: str | None = None, status: str | None = None):
-    return {"items": store().recent(limit, before_id, model or None, status or None)}
+                       model: str | None = None, status: str | None = None,
+                       key_id: int | None = None):
+    """key_id 0 = requests made without a key (before keys existed)."""
+    return {"items": store().recent(limit, before_id, model or None, status or None, key_id)}
 
 
 class TestBody(BaseModel):
@@ -278,6 +281,7 @@ async def probe_provider(name: str, max_age: int = 0):
 
 
 admin_app.include_router(admin_config.router, dependencies=[Depends(require_admin)])
+admin_app.include_router(admin_keys.router, dependencies=[Depends(require_admin)])
 
 
 # ─── UI ───────────────────────────────────────────────────────

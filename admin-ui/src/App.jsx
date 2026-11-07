@@ -7,6 +7,7 @@ import { AUTH_REQUIRED_EVENT, SETTINGS_EVENT } from './lib/settings'
 import Dashboard from './pages/Dashboard'
 import Models from './pages/Models'
 import Providers from './pages/Providers'
+import Keys from './pages/Keys'
 import Requests from './pages/Requests'
 import Settings from './pages/Settings'
 import Login from './pages/Login'
@@ -19,6 +20,7 @@ const PAGES = {
   dashboard: Dashboard,
   models: Models,
   providers: Providers,
+  keys: Keys,
   stats: Stats,
   requests: Requests,
   settings: Settings,

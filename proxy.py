@@ -12,7 +12,9 @@ Design:
   - On upstream failure (network, 429, 5xx, bad key…) the request moves to
     the model's `fallback` and stays there for the rest of the request
   - Streaming streams every turn live; tool-call turns are executed silently
-  - Every request is logged (metadata only) for the admin panel (admin.py)
+  - /v1/* needs a project API key (apikeys.py): allowed models, server tools,
+    daily / 30-day token limits; fallback stays within the key's models
+  - Every request is logged (metadata only, with its key) for the admin panel (admin.py)
 """
 import json
 import logging
@@ -23,6 +25,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+import apikeys
 import config
 import health
 from providers import Model, get_registry
@@ -58,12 +61,13 @@ class UpstreamError(Exception):
 
 # ─── Per-request record (written to the stats DB at the end) ───
 class Rec:
-    def __init__(self, requested, stream, client, source="api"):
+    def __init__(self, requested, stream, client, source="api", key_id=None, allow_tools=True):
         self.t0 = time.monotonic()
         self.d = {"ts": time.time(), "requested": requested, "stream": int(bool(stream)),
                   "status": "ok", "fallback": 0, "prompt_tokens": 0,
                   "completion_tokens": 0, "turns": 0, "tool_calls": 0,
-                  "client": client, "source": source}
+                  "client": client, "source": source, "key_id": key_id}
+        self.allow_tools = allow_tools      # the API key may use the server tools
         self.tools: list[str] = []
         self.first_model: str | None = None
 
@@ -118,11 +122,18 @@ def model_info(m: Model, default: str) -> dict:
     }
 
 
+@app.exception_handler(apikeys.ApiError)
+async def _api_error(request: Request, e: apikeys.ApiError):
+    return JSONResponse(e.body(), status_code=e.status, headers=e.headers)
+
+
 @app.get("/v1/models")
-async def list_models():
+async def list_models(request: Request):
+    caller = apikeys.authenticate(request)
     reg = get_registry()
     return {"object": "list",
-            "data": [model_info(m, reg.default_model) for m in reg.models.values()]}
+            "data": [model_info(m, reg.default_model) for m in reg.models.values()
+                     if caller.allows(m.alias)]}
 
 
 # ─── Helpers ──────────────────────────────────────────────────
@@ -130,10 +141,10 @@ def _tool_name(schema: dict) -> str:
     return schema.get("function", {}).get("name", "")
 
 
-def merge_tools(model: Model, client_tools: list) -> tuple[list, set]:
+def merge_tools(model: Model, client_tools: list, allow_server: bool = True) -> tuple[list, set]:
     """Client tools + server tools (client wins on name clash).
     Returns (tools to send, names the proxy executes itself)."""
-    if not model.tools:
+    if not model.tools or not allow_server:
         return client_tools, set()
     client_names = {_tool_name(t) for t in client_tools}
     server = [t for t in SERVER_TOOLS_SCHEMA if _tool_name(t) not in client_names]
@@ -212,7 +223,7 @@ async def call_chain(chain: list[Model], body: dict, messages: list, client_tool
     """Try each model in the chain; return (index, response, server_tool_names)."""
     last_err = None
     for i, model in enumerate(chain):
-        tools, server_names = ([], set()) if force_no_tools else merge_tools(model, client_tools)
+        tools, server_names = ([], set()) if force_no_tools else merge_tools(model, client_tools, rec.allow_tools)
         try:
             data = await post_chat(model, build_payload(model, body, messages, tools, False))
             if i:
@@ -287,7 +298,7 @@ async def handle_stream(body: dict, chain: list[Model], rec: Rec):
 
                 opened = False
                 for i, model in enumerate(chain):
-                    tools, server_names = ([], set()) if final_turn else merge_tools(model, client_tools)
+                    tools, server_names = ([], set()) if final_turn else merge_tools(model, client_tools, rec.allow_tools)
                     payload = build_payload(model, body, messages, tools, True)
                     acc: dict[int, dict] = {}   # index -> accumulated tool call
                     held: list[str] = []        # raw tool-call chunks, flushed only for client tools
@@ -402,12 +413,20 @@ async def handle_stream(body: dict, chain: list[Model], rec: Rec):
 # ─── Main endpoint ────────────────────────────────────────────
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    body = await request.json()
+    caller = apikeys.authenticate(request)
+    apikeys.check_limits(caller)
+    try:
+        body = await request.json()
+    except ValueError:
+        raise apikeys.ApiError(400, "Request body is not valid JSON.", "invalid_json")
     reg = get_registry()
-    model = reg.resolve(body.get("model"))
-    chain = reg.fallback_chain(model)
-    rec = Rec(body.get("model"), body.get("stream"),
-              request.client.host if request.client else None)
+    model = apikeys.resolve_model(caller, reg, body.get("model"))
+    if body.get("model") and body.get("model") not in reg.models:
+        log.info("unknown model %r -> %r", body.get("model"), model.alias)
+    # fallback only moves to models this key may use
+    chain = [m for m in reg.fallback_chain(model) if caller.allows(m.alias)]
+    rec = Rec(body.get("model"), body.get("stream"), apikeys.client_ip(request),
+              key_id=caller.id, allow_tools=caller.tools)
 
     if body.get("stream"):
         return await handle_stream(body, chain, rec)

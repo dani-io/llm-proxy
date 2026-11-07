@@ -49,11 +49,33 @@ CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
     expires    REAL NOT NULL
 );
+
+-- Project API keys for the model API. Only a sha256 of the key is stored.
+CREATE TABLE IF NOT EXISTS api_keys (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    prefix         TEXT    NOT NULL,        -- shown in the panel, not usable
+    key_hash       TEXT    NOT NULL UNIQUE,
+    models         TEXT,                    -- JSON list of aliases; NULL = every model
+    tools          INTEGER NOT NULL DEFAULT 1,   -- may use web_search / fetch_url
+    daily_tokens   INTEGER,                 -- NULL = no limit (Tehran day)
+    monthly_tokens INTEGER,                 -- NULL = no limit (last 30 Tehran days)
+    expires_at     REAL,
+    active         INTEGER NOT NULL DEFAULT 1,
+    note           TEXT,
+    created_at     REAL    NOT NULL,
+    updated_at     REAL    NOT NULL,
+    last_used_at   REAL,
+    last_used_ip   TEXT
+);
 """
 
 COLUMNS = ("ts", "requested", "model", "provider", "stream", "status", "fallback",
            "latency_ms", "ttft_ms", "prompt_tokens", "completion_tokens", "turns",
-           "tool_calls", "tools", "error", "client", "source")
+           "tool_calls", "tools", "error", "client", "source", "key_id")
+
+KEY_FIELDS = ("name", "models", "tools", "daily_tokens", "monthly_tokens",
+              "expires_at", "active", "note")
 
 
 class Store:
@@ -64,8 +86,15 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        self._migrate()
         self._last_purge = 0.0
         self.purge()
+
+    def _migrate(self) -> None:
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(requests)")}
+        if "key_id" not in cols:   # pre-keys DB: older rows keep key_id NULL
+            self.db.execute("ALTER TABLE requests ADD COLUMN key_id INTEGER")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_requests_key_ts ON requests(key_id, ts)")
 
     # ── writes ──────────────────────────────────────────────
     def log_request(self, rec: dict) -> None:
@@ -129,17 +158,110 @@ class Store:
             {"b": bucket_seconds, "since": since, "off": tz_offset})
 
     def recent(self, limit: int = 50, before_id: int | None = None,
-               model: str | None = None, status: str | None = None) -> list[dict]:
+               model: str | None = None, status: str | None = None,
+               key_id: int | None = None) -> list[dict]:
         where, args = ["1=1"], []
         if before_id:
-            where.append("id < ?"); args.append(before_id)
+            where.append("r.id < ?"); args.append(before_id)
         if model:
-            where.append("model = ?"); args.append(model)
+            where.append("r.model = ?"); args.append(model)
         if status:
-            where.append("status = ?"); args.append(status)
+            where.append("r.status = ?"); args.append(status)
+        if key_id is not None:
+            where.append("COALESCE(r.key_id, 0) = ?"); args.append(key_id)
         args.append(max(1, min(limit, 500)))
         return self._all(
-            f"SELECT * FROM requests WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ?", args)
+            f"""SELECT r.*, k.name AS key_name FROM requests r
+                LEFT JOIN api_keys k ON k.id = r.key_id
+                WHERE {' AND '.join(where)} ORDER BY r.id DESC LIMIT ?""", args)
+
+    # ── project API keys ────────────────────────────────────
+    def create_key(self, fields: dict, prefix: str, key_hash: str) -> dict:
+        now = time.time()
+        f = {k: fields.get(k) for k in KEY_FIELDS}
+        f["active"] = 1 if f["active"] is None else int(bool(f["active"]))
+        f["tools"] = 1 if f["tools"] is None else int(bool(f["tools"]))
+        with self.lock:
+            cur = self.db.execute(
+                f"""INSERT INTO api_keys ({','.join(KEY_FIELDS)}, prefix, key_hash, created_at, updated_at)
+                    VALUES ({','.join('?' * len(KEY_FIELDS))}, ?, ?, ?, ?)""",
+                (*f.values(), prefix, key_hash, now, now))
+            new_id = cur.lastrowid
+        return self.get_key(new_id)
+
+    def get_key(self, key_id: int) -> dict | None:
+        rows = self._all("SELECT * FROM api_keys WHERE id = ?", (key_id,))
+        return rows[0] if rows else None
+
+    def get_key_by_hash(self, key_hash: str) -> dict | None:
+        rows = self._all("SELECT * FROM api_keys WHERE key_hash = ?", (key_hash,))
+        return rows[0] if rows else None
+
+    def list_keys(self) -> list[dict]:
+        return self._all("SELECT * FROM api_keys ORDER BY name COLLATE NOCASE")
+
+    def update_key(self, key_id: int, fields: dict) -> dict | None:
+        sets = {k: v for k, v in fields.items() if k in KEY_FIELDS}
+        if sets:
+            for b in ("active", "tools"):
+                if b in sets:
+                    sets[b] = int(bool(sets[b]))
+            with self.lock:
+                self.db.execute(
+                    f"UPDATE api_keys SET {', '.join(f'{k} = ?' for k in sets)}, updated_at = ? WHERE id = ?",
+                    (*sets.values(), time.time(), key_id))
+        return self.get_key(key_id)
+
+    def replace_key_secret(self, key_id: int, prefix: str, key_hash: str) -> dict | None:
+        with self.lock:
+            self.db.execute("UPDATE api_keys SET prefix = ?, key_hash = ?, updated_at = ? WHERE id = ?",
+                            (prefix, key_hash, time.time(), key_id))
+        return self.get_key(key_id)
+
+    def delete_key(self, key_id: int) -> bool:
+        """Its requests keep their key_id, so usage history survives."""
+        with self.lock:
+            return self.db.execute("DELETE FROM api_keys WHERE id = ?", (key_id,)).rowcount == 1
+
+    def touch_key(self, key_id: int, ip: str | None) -> None:
+        with self.lock:
+            self.db.execute("UPDATE api_keys SET last_used_at = ?, last_used_ip = ? WHERE id = ?",
+                            (time.time(), ip, key_id))
+
+    def key_tokens_since(self, key_id: int, since: float) -> int:
+        rows = self._all("""SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS t
+                            FROM requests WHERE key_id = ? AND ts >= ?""", (key_id, since))
+        return int(rows[0]["t"])
+
+    def key_usage(self, day: float, week: float, month: float) -> dict[int, dict]:
+        """{key_id (0 = no key): {today/week/month requests and tokens, last_ts}}."""
+        rows = self._all("""
+            SELECT COALESCE(key_id, 0) AS key_id,
+                   SUM(ts >= :d)                                            AS today_requests,
+                   SUM(CASE WHEN ts >= :d THEN prompt_tokens + completion_tokens ELSE 0 END) AS today_tokens,
+                   SUM(ts >= :w)                                            AS week_requests,
+                   SUM(CASE WHEN ts >= :w THEN prompt_tokens + completion_tokens ELSE 0 END) AS week_tokens,
+                   COUNT(*)                                                 AS month_requests,
+                   SUM(prompt_tokens + completion_tokens)                   AS month_tokens,
+                   SUM(prompt_tokens)                                       AS month_prompt_tokens,
+                   SUM(completion_tokens)                                   AS month_completion_tokens,
+                   SUM(status = 'error')                                    AS month_errors,
+                   MAX(ts)                                                  AS last_ts
+            FROM requests WHERE ts >= :m AND source = 'api'
+            GROUP BY COALESCE(key_id, 0)""", {"d": day, "w": week, "m": month})
+        return {r["key_id"]: r for r in rows}
+
+    def key_models(self, since: float) -> dict[int, list[dict]]:
+        """{key_id: [{model, requests, tokens}]} over the window, busiest first."""
+        out: dict[int, list[dict]] = {}
+        for r in self._all("""
+                SELECT COALESCE(key_id, 0) AS key_id, model, COUNT(*) AS requests,
+                       SUM(prompt_tokens + completion_tokens) AS tokens
+                FROM requests WHERE ts >= ? AND source = 'api'
+                GROUP BY COALESCE(key_id, 0), model ORDER BY requests DESC""", (since,)):
+            out.setdefault(r["key_id"], []).append(
+                {"model": r["model"], "requests": r["requests"], "tokens": r["tokens"] or 0})
+        return out
 
     # ── admin auth ──────────────────────────────────────────
     @staticmethod

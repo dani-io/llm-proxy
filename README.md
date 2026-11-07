@@ -18,6 +18,10 @@ OpenAI-compatible API, with server-side tool calling.
   request switches to the model's `fallback` and stays there.
 - **True streaming** — every turn is streamed live; tool-call turns are run
   silently, and no answer is generated twice.
+- **API keys per project** — the model API only accepts keys issued in the
+  admin panel (`Authorization: Bearer llp_…`, the `api_key` of any OpenAI SDK).
+  Each key has its allowed models, server tools on/off, daily and 30-day token
+  limits, an expiry and an on/off switch; usage is counted per key.
 
 ## Admin panel
 
@@ -25,6 +29,8 @@ Served by the same process on `ADMIN_PORT` (default **8002**), separate from
 the model API:
 
 - **Dashboard** — today's requests, errors, tokens, latency; model and provider health
+- **API Keys** — one key per project: allowed models, token limits (Tehran day /
+  last 30 days), expiry, rotate; usage per project and per model
 - **Models** — health, usage, and a one-click test call per model
 - **Providers** — health, key hint, and *Check now* (`GET /models`, no quota) with
   a searchable list of upstream model ids
@@ -56,9 +62,35 @@ Restart after editing either file.
 
 ## Endpoints
 
-- `GET /health` — status, tools, models, default model
-- `GET /v1/models` — model aliases with provider, tool support, fallback, external flag
+- `GET /health` — status, tools, models, default model (no key needed — for Uptime Kuma)
+- `GET /v1/models` — the models this key may use, with provider, tool support,
+  fallback and external flag
 - `POST /v1/chat/completions` — OpenAI-compatible, streaming and non-streaming
+
+`/v1/*` needs `Authorization: Bearer <key>`. Errors use the OpenAI shape
+(`{"error": {"message", "type", "code"}}`):
+
+| HTTP | code | when |
+|------|------|------|
+| 401 | `missing_api_key` / `invalid_api_key` | no key, or unknown key |
+| 403 | `api_key_disabled` / `api_key_expired` | key switched off or past its expiry |
+| 403 | `model_not_allowed` | the key may not use the requested model |
+| 429 | `daily_limit_reached` / `monthly_limit_reached` | token limit used up (`Retry-After` until 00:00 Tehran) |
+
+A missing or unknown `model` goes to the default model, or to the key's first
+allowed model when the default isn't one of them. Fallback only moves to models
+the key may use. Limits are checked before a request starts, so a single
+request can go slightly over.
+
+Using it from a project on Coolify: store the key as a secret env var and point
+the OpenAI client at the proxy.
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(base_url="http://llm.bp/v1", api_key=os.environ["LLM_API_KEY"])
+```
 
 ## Privacy
 

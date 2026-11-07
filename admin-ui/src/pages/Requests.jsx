@@ -15,6 +15,17 @@ function Row({ r }) {
     <>
       <tr onClick={() => setOpen((v) => !v)} className="cursor-pointer hover:bg-slate-50">
         <td className="px-4 py-2.5 whitespace-nowrap text-xs text-slate-500" title={formatTimestamp(r.ts)}>{formatRelative(r.ts)}</td>
+        <td className="px-4 py-2.5 whitespace-nowrap text-xs">
+          {r.key_name ? (
+            <span className="font-medium text-slate-900">{r.key_name}</span>
+          ) : r.key_id ? (
+            <span className="text-slate-400">key #{r.key_id} (deleted)</span>
+          ) : r.source === 'test' ? (
+            <span className="text-slate-400">panel</span>
+          ) : (
+            <span className="text-slate-400">no key</span>
+          )}
+        </td>
         <td className="px-4 py-2.5 whitespace-nowrap">
           <span className="font-mono text-xs text-slate-900">{r.model ?? '—'}</span>
           {r.fallback ? <span className="ml-1.5"><Tag tone="amber" title="Started on another model, served by its fallback">fallback</Tag></span> : null}
@@ -42,7 +53,7 @@ function Row({ r }) {
       </tr>
       {open && (
         <tr className="bg-slate-50">
-          <td colSpan={8} className="px-4 py-3">
+          <td colSpan={9} className="px-4 py-3">
             <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-xs sm:grid-cols-4">
               <div><dt className="text-slate-500">Time</dt><dd className="mt-0.5 text-slate-900">{formatTimestamp(r.ts)}</dd></div>
               <div><dt className="text-slate-500">Client asked for</dt><dd className="mt-0.5 font-mono text-slate-900">{r.requested ?? '(none)'}</dd></div>
@@ -60,20 +71,22 @@ function Row({ r }) {
 export default function Requests() {
   const [model, setModel] = useState('')
   const [status, setStatus] = useState('')
+  const [keyId, setKeyId] = useState('')
   const [older, setOlder] = useState([])
   const [loadingMore, setLoadingMore] = useState(false)
   const [done, setDone] = useState(false)
   const overview = useApiData(() => api.overview())
+  const keyList = useApiData(() => api.listKeys())
 
   const latest = useApiData(
     async () => {
-      const res = await api.requests({ limit: PAGE, model, status })
+      const res = await api.requests({ limit: PAGE, model, status, keyId })
       setOlder([])
       setDone(res.items.length < PAGE)
       return res
     },
     // Live-refresh only while viewing the newest page.
-    { interval: older.length ? 0 : 10000, deps: [model, status] },
+    { interval: older.length ? 0 : 10000, deps: [model, status, keyId] },
   )
   const items = [...(latest.data?.items ?? []), ...older]
 
@@ -82,7 +95,7 @@ export default function Requests() {
     if (!last) return
     setLoadingMore(true)
     try {
-      const res = await api.requests({ limit: PAGE, beforeId: last.id, model, status })
+      const res = await api.requests({ limit: PAGE, beforeId: last.id, model, status, keyId })
       setOlder((o) => [...o, ...res.items])
       setDone(res.items.length < PAGE)
     } finally {
@@ -99,6 +112,11 @@ export default function Requests() {
         description="Metadata only — prompts and answers are never stored. Click a row for details."
         actions={
           <>
+            <select value={keyId} onChange={(e) => setKeyId(e.target.value)} className={selectClass} aria-label="Filter by API key">
+              <option value="">All keys</option>
+              {(keyList.data?.keys ?? []).map((k) => <option key={k.id} value={k.id}>{k.name}</option>)}
+              <option value="0">No key</option>
+            </select>
             <select value={model} onChange={(e) => setModel(e.target.value)} className={selectClass} aria-label="Filter by model">
               <option value="">All models</option>
               {models.map((m) => <option key={m} value={m}>{m}</option>)}
@@ -130,6 +148,7 @@ export default function Requests() {
                 <thead className="bg-slate-50 text-left text-xs text-slate-500">
                   <tr>
                     <th className="px-4 py-2 font-medium">When</th>
+                    <th className="px-4 py-2 font-medium">Key</th>
                     <th className="px-4 py-2 font-medium">Model</th>
                     <th className="px-4 py-2 font-medium">Status</th>
                     <th className="px-4 py-2 text-right font-medium">Latency</th>

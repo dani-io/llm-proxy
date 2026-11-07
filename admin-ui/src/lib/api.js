@@ -84,8 +84,15 @@ export const api = {
   overview: () => request('/overview'),
   series: (range) => request(`/stats/series${qs({ range })}`),
   statsModels: (days) => request(`/stats/models${qs({ days })}`),
-  requests: ({ limit = 50, beforeId, model, status } = {}) =>
-    request(`/requests${qs({ limit, before_id: beforeId, model, status })}`),
+  requests: ({ limit = 50, beforeId, model, status, keyId } = {}) =>
+    request(`/requests${qs({ limit, before_id: beforeId, model, status, key_id: keyId })}`),
+
+  // ── Project API keys: the plaintext key comes back only from create / rotate ──
+  listKeys: () => request('/keys'),
+  createKey: (body) => request('/keys', { method: 'POST', body }),
+  updateKey: (id, body) => request(`/keys/${id}`, { method: 'PATCH', body }),
+  rotateKey: (id) => request(`/keys/${id}/rotate`, { method: 'POST' }),
+  deleteKey: (id) => request(`/keys/${id}`, { method: 'DELETE' }),
 
   // One direct call to the model — no tools, no fallback.
   testModel: (alias, prompt) =>
