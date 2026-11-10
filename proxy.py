@@ -108,9 +108,11 @@ async def _startup():
 
 @app.get("/health")
 async def health_endpoint():
-    reg = get_registry()
-    return {"status": "ok", "tools": list(TOOLS),
-            "default_model": reg.default_model, "models": list(reg.models)}
+    """Liveness only — open without a key (Uptime Kuma) and reachable from the
+    internet, so it says nothing about models or tools. Details live in the
+    admin panel; a key's models come from /v1/models."""
+    get_registry()          # fails loudly if providers.yaml can't be loaded
+    return {"status": "ok"}
 
 
 def model_info(m: Model, default: str) -> dict:

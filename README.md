@@ -62,7 +62,8 @@ Restart after editing either file.
 
 ## Endpoints
 
-- `GET /health` — status, tools, models, default model (no key needed — for Uptime Kuma)
+- `GET /health` — `{"status": "ok"}` only, no key needed (Uptime Kuma). It is
+  public, so it lists no models or tools — those are in the admin panel
 - `GET /v1/models` — the models this key may use, with provider, tool support,
   fallback and external flag
 - `POST /v1/chat/completions` — OpenAI-compatible, streaming and non-streaming
